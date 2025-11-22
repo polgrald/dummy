@@ -16,6 +16,70 @@ class CustomerEmailProcessor:
     def __init__(self, excel_file_path):
         self.excel_file_path = excel_file_path
         self.customer_data = defaultdict(list)
+        # Lightweight persistent preferences
+        # Store preferences next to this script so they persist regardless of the current working directory
+        try:
+            self._prefs_path = (Path(__file__).parent / '.email_prefs.json').resolve()
+        except Exception:
+            # Fallback to CWD if __file__ is not available for any reason
+            self._prefs_path = Path('.email_prefs.json').resolve()
+        self._prefs = self._load_prefs()
+
+    # -------------------- Preferences helpers --------------------
+    def _load_prefs(self):
+        """Load preferences from the script directory, with a fallback migration
+        from a .email_prefs.json that may have been created in the current working directory
+        by older versions.
+        """
+        # 1) Primary: script-local prefs file
+        try:
+            if self._prefs_path.exists():
+                import json
+                with open(self._prefs_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        return data
+        except Exception:
+            pass
+
+        # 2) Fallback/migration: look in the current working directory
+        try:
+            cwd_prefs_path = (Path.cwd() / '.email_prefs.json').resolve()
+            if cwd_prefs_path != self._prefs_path and cwd_prefs_path.exists():
+                import json
+                with open(cwd_prefs_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    if isinstance(data, dict):
+                        # Save a copy into the script-local location for future runs
+                        try:
+                            self._prefs_path.parent.mkdir(parents=True, exist_ok=True)
+                            with open(self._prefs_path, 'w', encoding='utf-8') as wf:
+                                json.dump(data, wf, indent=2)
+                        except Exception:
+                            pass
+                        return data
+        except Exception:
+            pass
+
+        return {}
+
+    def _save_pref(self, key, value):
+        try:
+            import json
+            self._prefs[key] = value
+            # Ensure parent directory exists
+            try:
+                self._prefs_path.parent.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            with open(self._prefs_path, 'w', encoding='utf-8') as f:
+                json.dump(self._prefs, f, indent=2)
+        except Exception:
+            # Non-fatal if we cannot persist
+            pass
+
+    def _get_pref(self, key, default=None):
+        return self._prefs.get(key, default)
 
     def separate_data_per_customer(self):
         """Main function to process customer data and create emails"""
@@ -371,7 +435,7 @@ class CustomerEmailProcessor:
         print(f"📊 Processing columns: {list(data_sheet.columns)}")
 
         # Let user choose which column contains customer names
-        customer_col = self._choose_column(data_sheet.columns, "customer names")
+        customer_col = self._choose_column(data_sheet.columns, "customer names", pref_key="main_customer_column")
         if not customer_col:
             return
 
@@ -402,8 +466,17 @@ class CustomerEmailProcessor:
             for i, customer in enumerate(list(self.customer_data.keys())[:5]):
                 print(f"  {i + 1}. {customer} ({len(self.customer_data[customer])} invoices)")
 
-    def _choose_column(self, columns, column_type):
-        """Let user choose which column to use"""
+    def _choose_column(self, columns, column_type, pref_key=None):
+        """Let user choose which column to use, with optional preference memory."""
+        columns = list(columns)
+
+        # Auto-apply saved preference if available and present
+        if pref_key:
+            saved = self._get_pref(pref_key)
+            if saved and saved in columns:
+                print(f"\nUsing saved choice for {column_type}: {saved}")
+                return saved
+
         print(f"\nPlease choose which column contains {column_type}:")
         for i, col in enumerate(columns, 1):
             print(f"  {i}. {col}")
@@ -417,7 +490,10 @@ class CustomerEmailProcessor:
                 choice_num = int(choice)
 
                 if 1 <= choice_num <= len(columns):
-                    return columns[choice_num - 1]
+                    chosen = columns[choice_num - 1]
+                    if pref_key:
+                        self._save_pref(pref_key, chosen)
+                    return chosen
                 else:
                     print(f"Please enter a number between 1 and {len(columns)}")
             except ValueError:
@@ -437,7 +513,10 @@ class CustomerEmailProcessor:
             print("3. Display emails in terminal for copy/paste")
             print("4. Export to Excel (xlsxwriter)")
 
-            choice = input("Enter your choice (1-4): ").strip()
+            # New option 5: Save as Outlook drafts (Windows via Outlook; macOS via .eml files)
+            print("5. Save emails as Outlook drafts (Windows/macOS Outlook)")
+
+            choice = input("Enter your choice (1-5): ").strip()
 
             if choice == "1":
                 self._send_emails_automatically(email_addresses)
@@ -447,6 +526,8 @@ class CustomerEmailProcessor:
                 self._display_emails_in_terminal(email_addresses)
             elif choice == "4":
                 self._export_to_xlsxwriter(email_addresses)
+            elif choice == "5":
+                self._save_emails_to_outlook_drafts(email_addresses)
             else:
                 print("Invalid choice. Saving emails to files instead.")
                 self._save_emails_to_files(email_addresses)
@@ -469,12 +550,12 @@ class CustomerEmailProcessor:
         print(f"📧 Email sheet columns: {list(emails_sheet.columns)}")
 
         # Let user choose customer name column
-        customer_col = self._choose_column(emails_sheet.columns, "customer names")
+        customer_col = self._choose_column(emails_sheet.columns, "customer names", pref_key="emails_customer_column")
         if not customer_col:
             return email_addresses
 
         # Let user choose email column
-        email_col = self._choose_column(emails_sheet.columns, "email addresses")
+        email_col = self._choose_column(emails_sheet.columns, "email addresses", pref_key="emails_email_column")
         if not email_col:
             return email_addresses
 
@@ -483,12 +564,33 @@ class CustomerEmailProcessor:
             email_address = str(row.get(email_col, '')).strip()
 
             if customer_name and email_address and "@" in email_address:
-                email_addresses[customer_name] = email_address
-                print(f"  ✅ Found email for {customer_name}: {email_address}")
+                # Normalize and store as comma-separated for RFC compliance
+                addrs = self._parse_addresses(email_address)
+                if addrs:
+                    canonical = self._format_addrs_for_mime(addrs)
+                    email_addresses[customer_name] = canonical
+                    print(f"  ✅ Found email for {customer_name}: {canonical}")
             elif customer_name and email_address:
                 print(f"  ⚠️  Invalid email for {customer_name}: {email_address}")
 
         return email_addresses
+
+    # -------------------- Address helpers --------------------
+    def _parse_addresses(self, addr_str):
+        """Parse a string of email addresses separated by ';' or ',' into a list."""
+        if not addr_str:
+            return []
+        # Replace semicolons with commas, then split
+        tmp = addr_str.replace(';', ',')
+        parts = [p.strip() for p in tmp.split(',') if p.strip()]
+        # Basic filtering to include only parts containing '@'
+        return [p for p in parts if '@' in p]
+
+    def _format_addrs_for_mime(self, addrs):
+        return ", ".join(addrs)
+
+    def _format_addrs_for_outlook(self, addrs):
+        return "; ".join(addrs)
 
     def _build_invoice_string(self, invoices):
         """Build formatted string of invoice numbers"""
@@ -876,11 +978,14 @@ Type of Account: Checking
                                                                total_amount, invoices)
 
                 # Create message
+                DEFAULT_CC = ["executive.admin@ranaanalytics.com", "michael.wells@ranaanalytics.com"]
                 msg = MIMEMultipart('alternative')
                 msg['Subject'] = f"Rana Analytics - {customer_name} Account Overdue Notice"
                 msg['From'] = email_from
-                msg['To'] = customer_email
-                msg['Cc'] = "executive.admin@ranaanalytics.com, michael.wells@ranaanalytics.com"
+                # Normalize recipients for SMTP/MIME (comma-separated)
+                to_addrs = self._parse_addresses(customer_email)
+                msg['To'] = self._format_addrs_for_mime(to_addrs) if to_addrs else customer_email
+                msg['Cc'] = self._format_addrs_for_mime(DEFAULT_CC)
 
                 msg.attach(MIMEText(plain_text_body, 'plain'))
                 msg.attach(MIMEText(html_body, 'html'))
@@ -895,6 +1000,178 @@ Type of Account: Checking
 
         except Exception as e:
             print(f"❌ Error sending emails: {str(e)}")
+
+    def _save_emails_to_outlook_drafts(self, email_addresses):
+        """Create Outlook draft emails.
+
+        - On Windows: uses Outlook COM automation to save directly into Drafts.
+        - On macOS: writes .eml files compatible with Microsoft Outlook and can auto-open them.
+        """
+        print("\n💼 Creating Outlook draft emails...")
+
+        import sys
+        platform = sys.platform
+
+        # Windows path: COM automation into Drafts
+        if platform.startswith('win'):
+            try:
+                import win32com.client  # type: ignore
+                from win32com.client import constants  # type: ignore
+            except ImportError:
+                print("❌ python -m pip install pywin32 is required for Outlook integration on Windows.")
+                return
+            except Exception as e:
+                print(f"❌ Unable to initialize Outlook integration: {e}")
+                return
+
+            try:
+                outlook = win32com.client.Dispatch("Outlook.Application")
+                namespace = outlook.GetNamespace("MAPI")
+                drafts_folder = namespace.GetDefaultFolder(constants.olFolderDrafts)
+            except Exception as e:
+                print(f"❌ Could not access Outlook. Ensure Outlook is installed and configured. Details: {e}")
+                return
+
+            created = 0
+            skipped = 0
+            DEFAULT_CC = ["executive.admin@ranaanalytics.com", "michael.wells@ranaanalytics.com"]
+            default_from = self._get_pref("default_from_email")
+            for customer_name, invoices in self.customer_data.items():
+                try:
+                    customer_email = email_addresses.get(customer_name)
+                    if not customer_email:
+                        customer_email = input(f"Enter email address for {customer_name}: ").strip()
+                        if not customer_email:
+                            print(f"⚠️  Skipping {customer_name} (no email)")
+                            skipped += 1
+                            continue
+
+                    invoice_numbers = self._build_invoice_string(invoices)
+                    total_amount = self._calculate_total_amount(invoices)
+                    html_body = self._create_email_body(customer_name, invoice_numbers, total_amount,
+                                                        self._create_customer_table(invoices))
+                    plain_text_body = self._create_plain_text_body(customer_name, invoice_numbers,
+                                                                   total_amount, invoices)
+
+                    mail = outlook.CreateItem(0)  # 0 = olMailItem
+                    subject = f"Rana Analytics - {customer_name} Account Overdue Notice"
+                    mail.Subject = subject
+                    # Normalize recipients for Outlook (semicolon-separated)
+                    to_addrs = self._parse_addresses(customer_email)
+                    mail.To = self._format_addrs_for_outlook(to_addrs) if to_addrs else customer_email
+                    mail.CC = self._format_addrs_for_outlook(DEFAULT_CC)
+                    # Attempt to set From (requires proper permissions in Outlook profile)
+                    if default_from:
+                        try:
+                            mail.SentOnBehalfOfName = default_from
+                        except Exception:
+                            pass
+                    mail.Body = plain_text_body
+                    mail.HTMLBody = html_body
+                    mail.Save()  # Saves to Drafts by default
+
+                    created += 1
+                    print(f"✅ Draft created for: {customer_name} ({customer_email})")
+                except Exception as e:
+                    print(f"❌ Failed to create draft for {customer_name}: {e}")
+                    skipped += 1
+
+            try:
+                print(f"\n📨 Draft creation summary: {created} created, {skipped} skipped.")
+                drafts_count = len(drafts_folder.Items)
+                print(f"📁 Outlook Drafts folder now contains approximately {drafts_count} items.")
+            except Exception:
+                pass
+            return
+
+        # macOS path: write .eml files and optionally open in Outlook
+        if platform == 'darwin':
+            from pathlib import Path
+            from email.mime.multipart import MIMEMultipart
+            from email.mime.text import MIMEText
+            from email import policy
+            import subprocess
+
+            out_dir = Path("Customer_Emails") / "Outlook_Drafts_EML"
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            created = 0
+            skipped = 0
+
+            # Optionally allow user to set a default From for EML drafts (remembered)
+            default_from = self._get_pref("default_from_email")
+            if not default_from:
+                try:
+                    resp = input("Enter a default From email to use in drafts (press Enter to skip): ").strip()
+                    if resp:
+                        default_from = resp
+                        self._save_pref("default_from_email", default_from)
+                except Exception:
+                    pass
+
+            for customer_name, invoices in self.customer_data.items():
+                try:
+                    customer_email = email_addresses.get(customer_name)
+                    if not customer_email:
+                        customer_email = input(f"Enter email address for {customer_name}: ").strip()
+                        if not customer_email:
+                            print(f"⚠️  Skipping {customer_name} (no email)")
+                            skipped += 1
+                            continue
+
+                    invoice_numbers = self._build_invoice_string(invoices)
+                    total_amount = self._calculate_total_amount(invoices)
+                    html_body = self._create_email_body(customer_name, invoice_numbers, total_amount,
+                                                        self._create_customer_table(invoices))
+                    plain_text_body = self._create_plain_text_body(customer_name, invoice_numbers,
+                                                                   total_amount, invoices)
+
+                    DEFAULT_CC = ["executive.admin@ranaanalytics.com", "michael.wells@ranaanalytics.com"]
+                    msg = MIMEMultipart('alternative')
+                    subject = f"Rana Analytics - {customer_name} Account Overdue Notice"
+                    msg['Subject'] = subject
+                    to_addrs = self._parse_addresses(customer_email)
+                    msg['To'] = self._format_addrs_for_mime(to_addrs) if to_addrs else customer_email
+                    msg['Cc'] = self._format_addrs_for_mime(DEFAULT_CC)
+                    if default_from:
+                        msg['From'] = default_from
+
+                    msg.attach(MIMEText(plain_text_body, 'plain'))
+                    msg.attach(MIMEText(html_body, 'html'))
+
+                    # Clean filename
+                    clean_name = "".join(c for c in customer_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+                    clean_name = clean_name.replace(' ', '_')
+                    file_path = out_dir / f"{clean_name}.eml"
+
+                    with open(file_path, 'wb') as f:
+                        f.write(msg.as_bytes(policy=policy.SMTP))
+
+                    created += 1
+                    print(f"✅ EML draft saved for: {customer_name} → {file_path}")
+                except Exception as e:
+                    print(f"❌ Failed to create EML for {customer_name}: {e}")
+                    skipped += 1
+
+            print(f"\n📨 EML creation summary: {created} created, {skipped} skipped.")
+            if created:
+                try:
+                    open_now = input("Open the .eml drafts in Microsoft Outlook now? (y/N): ").strip().lower()
+                    if open_now == 'y':
+                        # Attempt to open all .eml files in Outlook. This works with both Classic and New Outlook.
+                        for eml_file in sorted(out_dir.glob('*.eml')):
+                            try:
+                                subprocess.run(["open", "-a", "Microsoft Outlook", str(eml_file)], check=False)
+                            except Exception:
+                                # Best-effort; continue with others
+                                pass
+                        print("✅ Requested Outlook to open all .eml drafts. In Outlook, click Save to place them into your Drafts folder.")
+                except Exception:
+                    pass
+            return
+
+        # Other platforms
+        print("❌ Drafting via Outlook is supported on Windows (Outlook Desktop) and macOS (via .eml files). Your platform is not supported.")
 
     def _save_emails_to_files(self, email_addresses):
         """Save emails as HTML files for manual sending"""
@@ -988,11 +1265,33 @@ def main():
         print("✅ Packages installed successfully!")
 
     # Get Excel file path
-    excel_file = input("Enter the path to your Excel file: ").strip()
+    # Provide a convenient default known location mentioned by you.
+    default_excel_path = "/Users/pauldesoloc/Downloads/Ranas.xlsx"
+    prompt = "Enter the path to your Excel file"
+    if os.path.exists(default_excel_path):
+        prompt += f" (Press Enter to use default: {default_excel_path})"
+    prompt += ": "
 
-    if not os.path.exists(excel_file):
-        print("❌ File not found! Please check the path and try again.")
-        return
+    user_input_path = input(prompt).strip()
+
+    if user_input_path:
+        excel_file = user_input_path
+        if not os.path.exists(excel_file):
+            # If the provided path doesn't exist but the default does, use the default transparently
+            if os.path.exists(default_excel_path):
+                print(f"⚠️  Provided path not found. Using default: {default_excel_path}")
+                excel_file = default_excel_path
+            else:
+                print("❌ File not found! Please check the path and try again.")
+                return
+    else:
+        # Empty input: try default if present
+        if os.path.exists(default_excel_path):
+            excel_file = default_excel_path
+            print(f"✅ Using default Excel file: {excel_file}")
+        else:
+            print("❌ No path provided and default file not found. Please run again and provide a valid path.")
+            return
 
     # Process the file
     processor = CustomerEmailProcessor(excel_file)
